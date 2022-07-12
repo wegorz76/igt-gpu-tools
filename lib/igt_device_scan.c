@@ -962,6 +962,14 @@ static void index_pci_devices(void)
  * Function sorts all found devices to keep same order of bus devices
  * for providing predictable search.
  */
+
+#define SIMULATE_UDEV_DEVICES
+#ifdef SIMULATE_UDEV_DEVICES
+
+#include "igt_device_scan_simulate.c"
+
+#endif
+
 static void scan_drm_devices(void)
 {
 	struct udev *udev;
