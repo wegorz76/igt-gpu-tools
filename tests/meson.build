@@ -166,6 +166,7 @@ intel_i915_progs = [
 	'gem_madvise',
 	'gem_media_fill',
 	'gem_media_vme',
+	'gem_mgpu',
 	'gem_mmap',
 	'gem_mmap_gtt',
 	'gem_mmap_offset',
