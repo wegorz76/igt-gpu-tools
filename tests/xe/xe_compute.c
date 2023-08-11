@@ -14,8 +14,8 @@
 #include <string.h>
 
 #include "igt.h"
+#include "intel_compute.h"
 #include "xe/xe_query.h"
-#include "xe/xe_compute.h"
 
 /**
  * SUBTEST: compute-square
@@ -29,7 +29,7 @@
 static void
 test_compute_square(int fd)
 {
-	igt_require_f(run_xe_compute_kernel(fd), "GPU not supported\n");
+	igt_require_f(run_compute_kernel(fd), "GPU not supported\n");
 }
 
 igt_main
