@@ -34,6 +34,7 @@ static struct param {
 	int vram_percent;
 	int min_size_kb;
 	int max_size_kb;
+	bool verify;
 } params = {
 	.num_objs = 0,
 	.vram_percent = OVERCOMMIT_VRAM_PERCENT,
@@ -178,15 +179,16 @@ static void dump_obj(const struct blt_copy_object *obj, int start_value)
 	fclose(out);
 }
 
-static void check_obj(const struct blt_copy_object *obj, uint64_t size,
+static void check_obj(const char *check_mode,
+		      const struct blt_copy_object *obj, uint64_t size,
 		      int start_value, int num_obj)
 {
 	int i, idx;
 
 	if (obj->ptr[0] != start_value ||
 	    (obj->ptr[size/4 - 1] != start_value + size/4 - 1)) {
-		igt_info("Failed object w: %d, h: %d, size: %ldKiB (%ldMiB)\n",
-			 obj->x2, obj->y2, obj->size / SZ_1K, obj->size / SZ_1M);
+		igt_info("[%s] Failed object w: %d, h: %d, size: %ldKiB (%ldMiB)\n",
+			 check_mode, obj->x2, obj->y2, obj->size / SZ_1K, obj->size / SZ_1M);
 		dump_obj(obj, start_value);
 	}
 
@@ -198,14 +200,14 @@ static void check_obj(const struct blt_copy_object *obj, uint64_t size,
 		idx = rand() % (size/4);
 
 		if (obj->ptr[idx] != start_value + idx) {
-			igt_info("Failed object w: %d, h: %d, size: %ldKiB (%ldMiB)\n",
-				 obj->x2, obj->y2, obj->size / SZ_1K, obj->size / SZ_1M);
+			igt_info("[%s] Failed object w: %d, h: %d, size: %ldKiB (%ldMiB)\n",
+				 check_mode, obj->x2, obj->y2, obj->size / SZ_1K, obj->size / SZ_1M);
 			dump_obj(obj, start_value);
 		}
 
 		igt_assert_f(obj->ptr[idx] == start_value + idx,
-			     "Object number %d doesn't contain valid data",
-			     num_obj);
+			     "[%s] Object number %d doesn't contain valid data",
+			     check_mode, num_obj);
 	}
 }
 
@@ -245,15 +247,32 @@ static void evict_single(int fd, int child, const struct config *config)
 	ctx = intel_ctx_xe(fd, vm, exec_queue, 0, 0, 0);
 
 	while (kb_left) {
+		struct blt_copy_object *verify_obj;
 		uint64_t obj_size = rand_and_update(&kb_left, min_alloc_kb, max_alloc_kb) * SZ_1K;
 		int start_value = rand();
 
 		obj = create_obj(&blt, ctx, ahnd, obj_size, start_value);
 		igt_list_add(&obj->link, &list);
 
+		if (config->param->verify) {
+			verify_obj = blt_create_object(&blt, system_memory(fd),
+						       obj->blt_obj->x2,
+						       obj->blt_obj->y2,
+						       32, uc_mocs,
+						       T_LINEAR, COMPRESSION_DISABLED,
+						       0, true);
+			copy_obj(&blt, obj->blt_obj, verify_obj, ctx, ahnd);
+			check_obj("Verify", verify_obj, obj->blt_obj->size, obj->start_value, num_obj++);
+			blt_destroy_object_and_alloc_free(fd, ahnd, verify_obj);
+			intel_allocator_bind(ahnd, 0, 0);
+		}
+
 		if (config->param->num_objs && ++num_obj == config->param->num_objs)
 			break;
 	}
+
+	if (config->param->verify)
+		igt_info("[%8d] Verify ok\n", getpid());
 
 	num_obj = 0;
 	igt_list_for_each_entry_safe(obj, tmp, &list, link) {
@@ -264,7 +283,7 @@ static void evict_single(int fd, int child, const struct config *config)
 					     T_LINEAR, COMPRESSION_DISABLED,
 					     0, true);
 		copy_obj(&blt, obj->blt_obj, orig_obj, ctx, ahnd);
-		check_obj(orig_obj, obj->blt_obj->size, obj->start_value, num_obj++);
+		check_obj("Check", orig_obj, obj->blt_obj->size, obj->start_value, num_obj++);
 		blt_destroy_object_and_alloc_free(fd, ahnd, orig_obj);
 
 		if (config->flags & TEST_INSTANTFREE) {
@@ -272,6 +291,7 @@ static void evict_single(int fd, int child, const struct config *config)
 			blt_destroy_object_and_alloc_free(fd, ahnd, obj->blt_obj);
 			free(obj);
 		}
+		intel_allocator_bind(ahnd, 0, 0);
 	}
 
 	if (!(config->flags & TEST_INSTANTFREE))
@@ -401,6 +421,10 @@ static int opt_handler(int opt, int opt_index, void *data)
 		params.max_size_kb = atoi(optarg);
 		igt_debug("Max size kb: %d\n", params.max_size_kb);
 		break;
+	case 'V':
+		params.verify = true;
+		igt_debug("Verify: %d\n", params.verify);
+		break;
 	default:
 		return IGT_OPT_HANDLER_ERROR;
 	}
@@ -415,9 +439,10 @@ const char *help_str =
 	"  -p\tPercent of VRAM to alloc\n"
 	"  -s\tMinimum size of object in kb\n"
 	"  -S\tMaximum size of object in kb\n"
+	"  -V\tVerify object after compressing\n"
 	;
 
-igt_main_args("ben:p:s:S:", NULL, help_str, opt_handler, NULL)
+igt_main_args("ben:p:s:S:V", NULL, help_str, opt_handler, NULL)
 {
 	struct drm_xe_engine_class_instance *hwe;
 
