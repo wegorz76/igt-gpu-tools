@@ -67,22 +67,17 @@ struct config {
 static void copy_obj(struct blt_copy_data *blt,
 		     struct blt_copy_object *src_obj,
 		     struct blt_copy_object *dst_obj,
-		     uint64_t ahnd, uint32_t vm)
+		     intel_ctx_t *ctx,
+		     uint64_t ahnd)
 {
 	struct blt_block_copy_data_ext ext = {};
 	int fd = blt->fd;
 	uint64_t bb_size = xe_get_default_alignment(fd);
-	struct drm_xe_engine_class_instance inst = {
-		.engine_class = DRM_XE_ENGINE_CLASS_COPY,
-	};
-	intel_ctx_t *ctx;
-	uint32_t bb, exec_queue;
+	uint32_t bb;
 	uint32_t w, h;
 
 	w = src_obj->x2;
 	h = src_obj->y2;
-	exec_queue = xe_exec_queue_create(fd, vm, &inst, 0);
-	ctx = intel_ctx_xe(fd, vm, exec_queue, 0, 0, 0);
 
 	bb = xe_bo_create_flags(fd, 0, bb_size,
 				vram_memory(fd, 0) | XE_GEM_CREATE_FLAG_NEEDS_VISIBLE_VRAM);
@@ -123,8 +118,7 @@ static uint32_t rand_and_update(uint32_t *left, uint32_t min, uint32_t max)
 }
 
 static struct object *create_obj(struct blt_copy_data *blt,
-				 struct blt_copy_object *src_obj,
-				 uint64_t ahnd, uint32_t vm,
+				 intel_ctx_t *ctx, uint64_t ahnd,
 				 uint64_t size, int start_value)
 {
 	int fd = blt->fd;
@@ -132,6 +126,7 @@ static struct object *create_obj(struct blt_copy_data *blt,
 	uint32_t w, h;
 	uint8_t uc_mocs = intel_get_uc_mocs_index(fd);
 	int i;
+	struct blt_copy_object *src;
 
 	obj = calloc(1, sizeof(*obj));
 	igt_assert(obj);
@@ -141,6 +136,15 @@ static struct object *create_obj(struct blt_copy_data *blt,
 	w = max_t(int, 1024, roundup_power_of_two(sqrt(size/4)));
 	h = size / w / 4; /* /4 - 32bpp */
 
+	igt_debug("Obj size: %ldKiB (%ldMiB) <w: %d, h: %d>\n",
+		  size / SZ_1K, size / SZ_1M, w, h);
+
+	src = blt_create_object(blt,
+				system_memory(fd),
+				w, h, 32, uc_mocs,
+				T_LINEAR, COMPRESSION_DISABLED,
+				COMPRESSION_TYPE_3D, true);
+
 	obj->blt_obj = blt_create_object(blt,
 					 vram_memory(fd, 0) | XE_GEM_CREATE_FLAG_NEEDS_VISIBLE_VRAM,
 					 w, h, 32, uc_mocs,
@@ -148,11 +152,30 @@ static struct object *create_obj(struct blt_copy_data *blt,
 					 COMPRESSION_TYPE_3D, true);
 
 	for (i = 0; i < size / sizeof(uint32_t); i++)
-		src_obj->ptr[i] = start_value++;
+		src->ptr[i] = start_value++;
 
-	copy_obj(blt, src_obj, obj->blt_obj, ahnd, vm);
+	copy_obj(blt, src, obj->blt_obj, ctx, ahnd);
+
+	blt_destroy_object_and_alloc_free(fd, ahnd, src);
+	intel_allocator_bind(ahnd, 0, 0);
 
 	return obj;
+}
+
+static void dump_obj(const struct blt_copy_object *obj, int start_value)
+{
+	FILE *out;
+
+	out = fopen("/tmp/dumpobj.data", "wb");
+	fwrite(obj->ptr, obj->size, 1, out);
+	fclose(out);
+
+	out = fopen("/tmp/dumpobj.expected", "wb");
+	for (int i = 0; i < obj->size / 4; i++) {
+		int v = start_value + i;
+		fwrite(&v, sizeof(int), 1, out);
+	}
+	fclose(out);
 }
 
 static void check_obj(const struct blt_copy_object *obj, uint64_t size,
@@ -160,12 +183,26 @@ static void check_obj(const struct blt_copy_object *obj, uint64_t size,
 {
 	int i, idx;
 
+	if (obj->ptr[0] != start_value ||
+	    (obj->ptr[size/4 - 1] != start_value + size/4 - 1)) {
+		igt_info("Failed object w: %d, h: %d, size: %ldKiB (%ldMiB)\n",
+			 obj->x2, obj->y2, obj->size / SZ_1K, obj->size / SZ_1M);
+		dump_obj(obj, start_value);
+	}
+
 	igt_assert_eq(obj->ptr[0], start_value);
 	igt_assert_eq(obj->ptr[size/4 - 1], start_value + size/4 - 1);
 
 	/* Couple of checks of random indices */
-	for (i = 0; i < 16; i++) {
+	for (i = 0; i < 128; i++) {
 		idx = rand() % (size/4);
+
+		if (obj->ptr[idx] != start_value + idx) {
+			igt_info("Failed object w: %d, h: %d, size: %ldKiB (%ldMiB)\n",
+				 obj->x2, obj->y2, obj->size / SZ_1K, obj->size / SZ_1M);
+			dump_obj(obj, start_value);
+		}
+
 		igt_assert_f(obj->ptr[idx] == start_value + idx,
 			     "Object number %d doesn't contain valid data",
 			     num_obj);
@@ -179,12 +216,16 @@ static void evict_single(int fd, int child, const struct config *config)
 	uint32_t kb_left = config->mb_per_proc * SZ_1K;
 	uint32_t min_alloc_kb = config->param->min_size_kb;
 	uint32_t max_alloc_kb = config->param->max_size_kb;
-	uint32_t vm = xe_vm_create(fd, DRM_XE_VM_CREATE_ASYNC_BIND_OPS, 0);
+	uint32_t vm = xe_vm_create(fd, DRM_XE_VM_CREATE_ASYNC_BIND_OPS, 0);	
 	uint64_t ahnd = intel_allocator_open(fd, vm, INTEL_ALLOCATOR_RELOC);
 	uint8_t uc_mocs = intel_get_uc_mocs_index(fd);
 	struct object *obj, *tmp;
 	struct igt_list_head list;
-	uint32_t w, h;
+	struct drm_xe_engine_class_instance inst = {
+		.engine_class = DRM_XE_ENGINE_CLASS_COPY,
+	};
+	intel_ctx_t *ctx;
+	uint32_t exec_queue;
 	int num_obj = 0;
 
 	if (config->flags & TEST_OBJ_64M)
@@ -199,22 +240,15 @@ static void evict_single(int fd, int child, const struct config *config)
 	igt_debug("[%2d] child : to allocate: %uMiB\n", child, kb_left/SZ_1K);
 
 	blt_copy_init(fd, &blt);
-	w = max_t(int, 1024, roundup_power_of_two(sqrt(max_alloc_kb * SZ_1K / 4)));
-	h = max_alloc_kb * SZ_1K / w / 4;
-	orig_obj = blt_create_object(&blt, system_memory(fd),
-				     w, h,  32, uc_mocs,
-				     T_LINEAR, COMPRESSION_DISABLED,
-				     0, true);
+
+	exec_queue = xe_exec_queue_create(fd, vm, &inst, 0);
+	ctx = intel_ctx_xe(fd, vm, exec_queue, 0, 0, 0);
 
 	while (kb_left) {
 		uint64_t obj_size = rand_and_update(&kb_left, min_alloc_kb, max_alloc_kb) * SZ_1K;
 		int start_value = rand();
 
-		igt_debug("[%2d] obj_size: %ldKiB (%ldMiB)\n", child,
-			  obj_size / SZ_1K, obj_size / SZ_1M);
-		h = obj_size / w / 4;
-		blt_set_geom(orig_obj, w * 4, 0, 0, w, h, 0, 0);
-		obj = create_obj(&blt, orig_obj, ahnd, vm, obj_size, start_value);
+		obj = create_obj(&blt, ctx, ahnd, obj_size, start_value);
 		igt_list_add(&obj->link, &list);
 
 		if (config->param->num_objs && ++num_obj == config->param->num_objs)
@@ -223,10 +257,16 @@ static void evict_single(int fd, int child, const struct config *config)
 
 	num_obj = 0;
 	igt_list_for_each_entry_safe(obj, tmp, &list, link) {
-		h = obj->size / w / 4;
-		blt_set_geom(orig_obj, w * 4, 0, 0, w, h, 0, 0);
-		copy_obj(&blt, obj->blt_obj, orig_obj, ahnd, vm);
+		orig_obj = blt_create_object(&blt, system_memory(fd),
+					     obj->blt_obj->x2,
+					     obj->blt_obj->y2,
+					     32, uc_mocs,
+					     T_LINEAR, COMPRESSION_DISABLED,
+					     0, true);
+		copy_obj(&blt, obj->blt_obj, orig_obj, ctx, ahnd);
 		check_obj(orig_obj, obj->blt_obj->size, obj->start_value, num_obj++);
+		blt_destroy_object_and_alloc_free(fd, ahnd, orig_obj);
+
 		if (config->flags & TEST_INSTANTFREE) {
 			igt_list_del(&obj->link);
 			blt_destroy_object_and_alloc_free(fd, ahnd, obj->blt_obj);
@@ -240,7 +280,6 @@ static void evict_single(int fd, int child, const struct config *config)
 			blt_destroy_object_and_alloc_free(fd, ahnd, obj->blt_obj);
 			free(obj);
 		}
-	blt_destroy_object_and_alloc_free(fd, ahnd, orig_obj);
 }
 
 static void set_config(int fd, uint32_t flags, const struct param *param,
@@ -327,23 +366,6 @@ static void evict_ccs(int fd, uint32_t flags, const struct param *param)
  *
  */
 /**
- * SUBTEST: evict-ccs-overcommit-%s-%s
- * Description: FlatCCS eviction test.
- * Feature: flatccs
- * Test category: stress test
- *
- * arg[1]:
- *
- * @single-object:		limit to one object
- * @two-objects:		limit to two objects
- *
- * arg[2]:
- *
- * @64M:			alloc 64M object (single ctrl-surf copy)
- * @128M:			alloc 128M object (two ctrl-surf copies)
- * @256M:			alloc 256M object (four ctrl-surf copies)
-*/
-/**
  * SUBTEST: evict-ccs-overcommit-standalone-%s
  * Description: FlatCCS eviction test.
  * Feature: flatccs
@@ -416,18 +438,6 @@ igt_main_args("ben:p:s:S:", NULL, help_str, opt_handler, NULL)
 		{ "standalone-128M",
 			TEST_OBJ_128M },
 		{ "standalone-256M",
-			TEST_OBJ_256M },
-		{ "single-object-64M",
-			TEST_OBJ_64M },
-		{ "single-object-128M",
-			TEST_OBJ_128M },
-		{ "single-object-256M",
-			TEST_OBJ_256M },
-		{ "two-objects-64M",
-			TEST_OBJ_64M },
-		{ "two-objects-128M",
-			TEST_OBJ_128M },
-		{ "two-objects-256M",
 			TEST_OBJ_256M },
 		{ "parallel-nofree-samefd",
 			TEST_PARALLEL },
