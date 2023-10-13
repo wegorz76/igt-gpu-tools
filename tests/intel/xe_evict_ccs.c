@@ -27,9 +27,13 @@
 #define OVERCOMMIT_VRAM_PERCENT 110
 #define MIN_OBJ_KB 64
 #define MAX_OBJ_KB (256 * 1024)
+#define DUMP_FILENAME "/tmp/object.data"
+#define DUMP_EXPFILENAME "/tmp/object.expected"
 
 static struct param {
 	bool print_bb;
+	bool disable_compression;
+	bool dump_corrupted_surface;
 	int num_objs;
 	int vram_percent;
 	int min_size_kb;
@@ -120,7 +124,8 @@ static uint32_t rand_and_update(uint32_t *left, uint32_t min, uint32_t max)
 
 static struct object *create_obj(struct blt_copy_data *blt,
 				 intel_ctx_t *ctx, uint64_t ahnd,
-				 uint64_t size, int start_value)
+				 uint64_t size, int start_value,
+				 bool disable_compression)
 {
 	int fd = blt->fd;
 	struct object *obj;
@@ -149,7 +154,9 @@ static struct object *create_obj(struct blt_copy_data *blt,
 	obj->blt_obj = blt_create_object(blt,
 					 vram_memory(fd, 0) | XE_GEM_CREATE_FLAG_NEEDS_VISIBLE_VRAM,
 					 w, h, 32, uc_mocs,
-					 T_LINEAR, COMPRESSION_ENABLED,
+					 T_LINEAR,
+					 disable_compression ? COMPRESSION_DISABLED :
+							       COMPRESSION_ENABLED,
 					 COMPRESSION_TYPE_3D, true);
 
 	for (i = 0; i < size / sizeof(uint32_t); i++)
@@ -167,11 +174,14 @@ static void dump_obj(const struct blt_copy_object *obj, int start_value)
 {
 	FILE *out;
 
-	out = fopen("/tmp/dumpobj.data", "wb");
+	if (!params.dump_corrupted_surface)
+		return;
+
+	out = fopen(DUMP_FILENAME, "wb");
 	fwrite(obj->ptr, obj->size, 1, out);
 	fclose(out);
 
-	out = fopen("/tmp/dumpobj.expected", "wb");
+	out = fopen(DUMP_EXPFILENAME, "wb");
 	for (int i = 0; i < obj->size / 4; i++) {
 		int v = start_value + i;
 		fwrite(&v, sizeof(int), 1, out);
@@ -251,7 +261,8 @@ static void evict_single(int fd, int child, const struct config *config)
 		uint64_t obj_size = rand_and_update(&kb_left, min_alloc_kb, max_alloc_kb) * SZ_1K;
 		int start_value = rand();
 
-		obj = create_obj(&blt, ctx, ahnd, obj_size, start_value);
+		obj = create_obj(&blt, ctx, ahnd, obj_size, start_value,
+				 config->param->disable_compression);
 		igt_list_add(&obj->link, &list);
 
 		if (config->param->verify) {
@@ -339,7 +350,8 @@ static void evict_ccs(int fd, uint32_t flags, const struct param *param)
 		snprintf(numstr, sizeof(numstr), "%d", param->num_objs);
 	else
 		strncpy(numstr, "limited to vram", sizeof(numstr));
-	igt_info("Params: num objects: %s, vram percent: %d, kb <min: %d, max: %d>\n",
+	igt_info("Params: compression: %s, num objects: %s, vram percent: %d, kb <min: %d, max: %d>\n",
+		 param->disable_compression ? "disabled" : "enabled",
 		 numstr, param->vram_percent,
 		 param->min_size_kb, param->max_size_kb);
 
@@ -405,6 +417,14 @@ static int opt_handler(int opt, int opt_index, void *data)
 		params.print_bb = true;
 		igt_debug("Print bb: %d\n", params.print_bb);
 		break;
+	case 'd':
+		params.disable_compression = true;
+		igt_debug("Print bb: %d\n", params.disable_compression);
+		break;
+	case 'D':
+		params.dump_corrupted_surface = true;
+		igt_debug("Print bb: %d\n", params.dump_corrupted_surface);
+		break;
 	case 'n':
 		params.num_objs = atoi(optarg);
 		igt_debug("Number objects: %d\n", params.num_objs);
@@ -434,6 +454,8 @@ static int opt_handler(int opt, int opt_index, void *data)
 
 const char *help_str =
 	"  -b\tPrint bb\n"
+	"  -d\tDisable compression (don't use flatccs area)\n"
+	"  -D\tDump surface which doesn't match\n"
 	"  -e\tAdd temporary object which enforce eviction\n"
 	"  -n\tNumber of objects to create (0 - 31)\n"
 	"  -p\tPercent of VRAM to alloc\n"
@@ -442,7 +464,7 @@ const char *help_str =
 	"  -V\tVerify object after compressing\n"
 	;
 
-igt_main_args("ben:p:s:S:V", NULL, help_str, opt_handler, NULL)
+igt_main_args("bdDn:p:s:S:V", NULL, help_str, opt_handler, NULL)
 {
 	struct drm_xe_engine_class_instance *hwe;
 
